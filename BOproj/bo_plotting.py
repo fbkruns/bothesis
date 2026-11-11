@@ -42,11 +42,12 @@ def _as_runs(runs):
 
 #where it sampled
 def plot_points(opt, dims=None, fixed=None, background=None, background_label="f(x)", n=150, ax=None, show=False,
-                save=None, title=None, cmap=None, background_scale="linear"):
+                save=None, title=None, cmap=None, background_scale="linear", step_colorbar=True):
     """The evaluated designs over a map of `background` (a callable X -> values, e.g. the true objective).
     background_scale 'linear' (default), or 'log': log-spaced colours (a display choice only, the values are untouched;
     values below 1e-4 of the maximum share the lowest colour) so that a function spanning orders of magnitude keeps
     its contrast.  Backgrounds with negative values always use linear colours.
+    step_colorbar False: no colour bar for the BO step (2-d plots; the plot gets the space).
 
     initial design: white squares;  BO points: coloured by step;  infeasible: hollow.  Also drawn: constraint
     boundaries c_i = 0 (white dashed), the true boundary u = 0 when the comparer has a .utility (magenta dotted), the
@@ -103,7 +104,7 @@ def plot_points(opt, dims=None, fixed=None, background=None, background_label="f
     scatter = axis.scatter(*bo_points[bo_feasible].T, c=bo_steps[bo_feasible], cmap="autumn", vmin=0,
                            vmax=max(len(bo_steps) - 1, 1), edgecolors="k", s=35, label="BO points")
     axis.scatter(*bo_points[~bo_feasible].T, facecolors="none", edgecolors="k", s=35)
-    if len(bo_steps):
+    if len(bo_steps) and step_colorbar:
         fig.colorbar(scatter, ax=axis, label="BO step")
     if opt.x_optimum is not None:
         axis.scatter(*opt.x_optimum[dims], marker="*", c="k", s=220, label="optimum")

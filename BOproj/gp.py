@@ -222,19 +222,49 @@ class PreferenceGP(_BaseGP):
         Probit: Phi(m / sqrt(2 + v)), m and v = posterior mean and variance of u(x) - u(x_ref), so the GP's uncertainty
         about the difference is integrated out in closed form.  Logit: sigmoid(m / sqrt(1 + pi v / 8)), the usual
         approximation."""
+        X = torch.as_tensor(X, dtype=DTYPE)
+        reference = torch.as_tensor(x_ref, dtype=X.dtype).reshape(1, -1)
+        prob = self.prob_better_matrix_torch(X.reshape(-1, X.shape[-1]), reference)
+        return prob.reshape(X.shape[:-1])
+
+    def prob_better_matrix_torch(self, X, X_ref, chunk_size=500):
+        """P(the DM prefers X[i] to X_ref[k]) for every pair (i, k), keeping gradients.
+
+        X      n designs in original units, shape (n, d).   X_ref  M reference designs, shape (M, d).
+        Returns an (n, M) matrix.  One joint posterior over a block of designs and X_ref gives the mean and variance of
+        every difference u(X[i]) - u(X_ref[k]), including the covariance between the two, so this is far cheaper than
+        n * M separate two-point posteriors.  Row i does not depend on the other designs, so X is cut into blocks of
+        chunk_size only to bound the size of the covariance matrix (n <= chunk_size: a single block).
+        Link as in prob_better_torch."""
         self._check_fitted()
         X = torch.as_tensor(X, dtype=DTYPE)
-        reference = torch.as_tensor(x_ref, dtype=X.dtype).reshape(1, 1, -1)
-        flat = X.reshape(-1, 1, X.shape[-1])
-        posterior = self.model.posterior(torch.cat([flat, reference.expand(len(flat), 1, -1)], dim=1))
-        mean, covariance = posterior.mean.squeeze(-1), posterior.mvn.covariance_matrix
-        diff_mean = mean[:, 0] - mean[:, 1]
-        diff_var = (covariance[:, 0, 0] + covariance[:, 1, 1] - 2 * covariance[:, 0, 1]).clamp_min(0)
+        X_ref = torch.as_tensor(X_ref, dtype=DTYPE)
+        blocks = [self._prob_better_block(X[start:start + chunk_size], X_ref) for start in range(0, len(X), chunk_size)]
+        return torch.cat(blocks)
+
+    def _prob_better_block(self, X, X_ref):
+        """prob_better_matrix_torch for one block of designs: a single joint posterior over X and X_ref."""
+        n = len(X)
+        posterior = self.model.posterior(torch.cat([X, X_ref]).unsqueeze(0))
+        mean = posterior.mean.reshape(-1)
+        covariance = posterior.mvn.covariance_matrix.reshape(len(mean), len(mean))
+        variance = covariance.diagonal()
+        diff_mean = mean[:n, None] - mean[None, n:]
+        diff_var = (variance[:n, None] + variance[None, n:] - 2 * covariance[:n, n:]).clamp_min(0)
         if self.link == "probit":
-            prob = torch.special.ndtr(diff_mean / torch.sqrt(2 + diff_var))
-        elif self.link == "logit":
-            prob = torch.sigmoid(diff_mean / torch.sqrt(1 + math.pi * diff_var / 8))
-        return prob.reshape(X.shape[:-1])
+            return torch.special.ndtr(diff_mean / torch.sqrt(2 + diff_var))
+        return torch.sigmoid(diff_mean / torch.sqrt(1 + math.pi * diff_var / 8))
+
+    def soft_copeland_torch(self, X, landmarks=None):
+        """Soft-Copeland score of Gonzalez et al. (2017), eq. 5, keeping gradients: C(x) = mean over the landmarks x_k
+        of P(the DM prefers x to x_k), the average probability that x wins a duel.  Its maximiser is the Condorcet winner.
+
+        X          n designs in original units, shape (n, d).
+        landmarks  M designs standing in for the integral over the box, shape (M, d); None: X itself (e.g. a grid).
+        Returns one score in [0, 1] per design, shape (n,)."""
+        X = torch.as_tensor(X, dtype=DTYPE)
+        landmarks = X if landmarks is None else landmarks
+        return self.prob_better_matrix_torch(X, landmarks).mean(dim=1)
 
     def plot(self, **kwargs):
         """Latent utility with arrows from loser to winner.  Arguments: gp_plotting.plot_preference."""

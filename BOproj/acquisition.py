@@ -24,17 +24,19 @@ from botorch.utils.transforms import t_batch_mode_transform
 
 
 class LogEIProduct(AcquisitionFunction):
-    """log [EI(x) * prod_i PoF_i(x) * pi(x)].
+    """log [EI(x) * prod_i PoF_i(x) * pi(x)], pi(x) = E[Phi(u(x))] or, with landmarks, the soft-Copeland score C(x).
 
     f_gp       fitted ContinuousGP of the objective
     c_gps      fitted ContinuousGPs, one per constraint c_i(x) <= 0 (may be empty)
     pref_gp    fitted PreferenceGP of the decision maker's comparisons (None: no preference factor)
     best_f     best observed value among feasible designs (the EI threshold); None = there is none yet
+    copeland   a prepared copeland.SoftCopeland (pref_gp and fixed landmarks): the preference factor is then the
+               soft-Copeland score C(x) (González et al. 2017, eq. 5) instead of pi(x); None: pi(x)
     """
 
-    def __init__(self, f_gp, c_gps=(), pref_gp=None, best_f=None):
+    def __init__(self, f_gp, c_gps=(), pref_gp=None, best_f=None, copeland=None):
         super().__init__(model=f_gp.model)
-        self.c_models, self.pref_gp = [c.model for c in c_gps], pref_gp
+        self.c_models, self.pref_gp, self.copeland = [c.model for c in c_gps], pref_gp, copeland
         self.log_ei = None if best_f is None else LogExpectedImprovement(f_gp.model, best_f=best_f)
 
     def log_pof(self, X):
@@ -47,10 +49,14 @@ class LogEIProduct(AcquisitionFunction):
         return total
 
     def log_pref(self, X):
-        """log pi(X), shape (b,), for X of shape (b, 1, d); 0 without a preference model."""
+        """log of the preference factor (pi or Copeland), shape (b,), for X of shape (b, 1, d); 0 without a preference model."""
         if self.pref_gp is None:
             return torch.zeros(X.shape[0], dtype=X.dtype)
-        return self.pref_gp.prob_torch(X).view(-1).clamp_min(1e-300).log()
+        if self.copeland is None:
+            score = self.pref_gp.prob_torch(X)
+        else:
+            score = self.copeland(X.reshape(-1, X.shape[-1]))
+        return score.view(-1).clamp_min(1e-300).log()
 
     @t_batch_mode_transform(expected_q=1)
     def forward(self, X):

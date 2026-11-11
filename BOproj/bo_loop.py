@@ -47,6 +47,7 @@ from scipy.stats import qmc
 
 from . import bo_plotting
 from .acquisition import LogEIProduct, optimize
+from .copeland import SoftCopeland
 from .gp import ContinuousGP, PreferenceGP
 from .gp_utils import DTYPE
 
@@ -76,6 +77,8 @@ class BayesianOptimizer:
     objective, bounds, constraints, comparer, X_pref:  see the module docstring
     init          initial design: 'sobol', 'lhs' or 'random', n_init points (default 2 (d + 1))
     strategy      'logei' (the BO step above) or 'random' (uniform points: a baseline with the same saved format)
+    preference_score  'probability' (the factor pi(x) = E[Phi(u(x))]) or 'copeland' (soft-Copeland score of x against
+                  n_landmarks fixed designs drawn once, uniformly in the bounds)
     f_optimum     known best value (benchmarks): regret = f_optimum - best y
     x_optimum     known best location: dist_to_opt = |best x - x_optimum|
     """
@@ -83,7 +86,10 @@ class BayesianOptimizer:
     num_restarts, raw_samples = 10, 512        # the acquisition optimiser's L-BFGS-B starts and random candidates
 
     def __init__(self, objective, bounds, constraints=(), comparer=None, X_pref=None, init="sobol", n_init=None,
-                 strategy="logei", seed=0, run_dir=None, f_optimum=None, x_optimum=None):
+                 strategy="logei", seed=0, run_dir=None, f_optimum=None, x_optimum=None,
+                 preference_score="probability", n_landmarks=64):
+        if preference_score not in ("probability", "copeland"):
+            raise ValueError("preference_score must be 'probability' or 'copeland'")
         self.objective, self.constraints = objective, list(constraints)
         self.bounds = np.asarray(bounds, float)
         self.d, self.m = len(self.bounds), len(self.constraints)
@@ -92,6 +98,8 @@ class BayesianOptimizer:
         self.init, self.n_init = init, n_init or 2 * (self.d + 1)
         self.X_init = initial_design(self.bounds, self.n_init, init, seed)
         self.strategy, self.seed, self.rng = strategy, seed, np.random.default_rng(seed)
+        self.preference_score, self.n_landmarks = preference_score, n_landmarks
+        self.landmarks = initial_design(self.bounds, n_landmarks, "random", seed) if preference_score == "copeland" else None
         self.run_dir = None if run_dir is None else Path(run_dir)
         self.f_optimum = f_optimum
         self.x_optimum = None if x_optimum is None else np.asarray(x_optimum, float)
@@ -100,6 +108,7 @@ class BayesianOptimizer:
         self.pairs_a = self.pairs_b = np.empty((0, self.d))       # the DM's comparisons: pairs_a[j] vs pairs_b[j] ...
         self.pairs_a_wins = np.empty(0, bool)                     # ... True if pairs_a[j] won
         self.preference_gp = None                                 # fitted once, on those comparisons
+        self.soft_copeland = None                                 # its Copeland score over the landmarks (copeland only)
         self.records, self.models = [], {}      # rows of history.csv;  n -> the GPs fitted on the first n evaluations
 
     #the data
@@ -188,6 +197,8 @@ class BayesianOptimizer:
         with seeded(self.seed):
             self.preference_gp = PreferenceGP(bounds=self.bounds, link="probit").fit(
                 self.pairs_a, self.pairs_b, self.pairs_a_wins)
+        if self.landmarks is not None:
+            self.soft_copeland = SoftCopeland(self.preference_gp, self.landmarks).prepare()
 
     #models
     def models_at(self, n=None):
@@ -210,7 +221,7 @@ class BayesianOptimizer:
         models = self.models_at(n)
         _, best_y = self.best(n)
         return LogEIProduct(models.objective, models.constraints, models.preference,
-                            best_f=None if np.isnan(best_y) else best_y)
+                            best_f=None if np.isnan(best_y) else best_y, copeland=self.soft_copeland)
 
     #recording and saving
     def _record(self, phase, proposal):
@@ -234,7 +245,8 @@ class BayesianOptimizer:
                   "strategy": self.strategy, "seed": self.seed,
                   "decision_maker": None if self.comparer is None else _name(getattr(self.comparer, "utility",
                                                                                      self.comparer)),
-                  "n_pref": len(self.X_pref),
+                  "n_pref": len(self.X_pref), "preference_score": self.preference_score,
+                  "n_landmarks": self.n_landmarks,
                   "f_optimum": self.f_optimum, "x_optimum": None if self.x_optimum is None else self.x_optimum.tolist(),
                   "num_restarts": self.num_restarts, "raw_samples": self.raw_samples,
                   "started": time.strftime("%Y-%m-%d %H:%M:%S"),
