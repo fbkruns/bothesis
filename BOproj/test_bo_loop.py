@@ -14,7 +14,7 @@ from botorch.acquisition.analytic import LogExpectedImprovement
 from scipy.stats import norm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))     # lets pytest find the package
-from BOproj.acquisition import LogEIProduct
+from BOproj.acquisition import LogEIOfProduct
 from BOproj.benchmarks import grid_optimum, u_linear
 from BOproj.bo_loop import BayesianOptimizer, initial_design, load_models
 from BOproj.gp import BinaryGP, ContinuousGP
@@ -45,7 +45,7 @@ def test_without_constraints_it_is_botorch_log_ei():
     _, f, _ = fitted()
     Xq = torch.as_tensor(np.random.default_rng(1).uniform(-2, 2, (20, 1, 2)))
     with torch.no_grad():
-        assert torch.allclose(LogEIProduct(f, [], best_f=-0.5)(Xq), LogExpectedImprovement(f.model, best_f=-0.5)(Xq))
+        assert torch.allclose(LogEIOfProduct(f, [], best_g=-0.5)(Xq), LogExpectedImprovement(f.model, best_f=-0.5)(Xq))
 
 
 def test_pof_is_phi_of_minus_mean_over_sd():
@@ -53,13 +53,13 @@ def test_pof_is_phi_of_minus_mean_over_sd():
     Xq = np.random.default_rng(2).uniform(-2, 2, (20, 2))
     m, v = c.predict(Xq)
     with torch.no_grad():
-        lp = LogEIProduct(f, [c], best_f=-0.5).log_pof(torch.as_tensor(Xq[:, None]))
+        lp = LogEIOfProduct(f, [c], best_g=-0.5).log_pof(torch.as_tensor(Xq[:, None]))
     assert np.allclose(np.exp(lp.numpy()), norm.cdf(-m / np.sqrt(v)), atol=1e-6)
 
 
 def test_nothing_feasible_means_pof_only():
     _, f, c = fitted()
-    acq = LogEIProduct(f, [c], best_f=None)
+    acq = LogEIOfProduct(f, [c], best_g=None)
     Xq = torch.as_tensor(np.random.default_rng(3).uniform(-2, 2, (10, 1, 2)))
     with torch.no_grad():
         assert acq.log_ei is None and torch.allclose(acq(Xq), acq.log_pof(Xq))
@@ -240,6 +240,25 @@ def test_recommended_is_improvement_times_preference_score_and_best_is_untouched
     assert np.isclose(opt.best()[1], opt.y.max())                       # the incumbent is still the highest y
 
 
+
+def test_log_ei_of_product_is_the_ei_of_y_times_c():
+    from BOproj.benchmarks import PairwiseLabeler
+    positive_bowl = lambda X: bowl(X) + 10                               # y > 0: the product y * C needs it
+    opt = FastOptimizer(positive_bowl, BOUNDS, comparer=PairwiseLabeler(u_linear), seed=0, preference_score="copeland",
+                        n_landmarks=16, X_pref=initial_design(BOUNDS, 10, "sobol", seed=1)).run(3)
+    acquisition = opt.acquisition()
+    best_g = np.max(opt.y * opt.preference_scores(opt.X))
+    assert np.isclose(acquisition.best_g, best_g)                       # the incumbent is the best product in the data
+    Xq = initial_design(BOUNDS, 16, "sobol", seed=5)
+    mean, var = opt.models_at().objective.predict(Xq)
+    C, sd = opt.preference_scores(Xq), np.sqrt(var)
+    z = (mean - best_g / C) / sd                                        # EI of f with the threshold g* / C(x), times C(x)
+    expected = C * sd * (norm.pdf(z) + z * norm.cdf(z))
+    with torch.no_grad():
+        Xt = torch.as_tensor(Xq[:, None, :])
+        assert np.allclose(acquisition(Xt).exp().numpy(), expected, rtol=1e-4, atol=1e-12)
+        assert torch.allclose(acquisition(Xt), acquisition.log_ei(Xt) + acquisition.log_pref(Xt))
+
 #known constraints (exact, no GP)
 
 
@@ -265,7 +284,7 @@ def test_initial_design_with_accept_keeps_only_accepted_designs_and_is_unchanged
 def test_optimize_with_known_constraints_returns_a_known_feasible_point_that_beats_random_feasible_ones():
     from BOproj.acquisition import known_feasible, optimize
     X, f_gp, _ = fitted()
-    acquisition = LogEIProduct(f_gp, best_f=float(bowl(X).max()))
+    acquisition = LogEIOfProduct(f_gp, best_g=float(bowl(X).max()))
     x, value = optimize(acquisition, BOUNDS, 2, known_constraints=[known_cut])
     assert values(known_cut, x)[0] <= 0                                 # exactly feasible, also when the optimum is on the edge
     rng = np.random.default_rng(0)
@@ -281,7 +300,7 @@ def test_optimize_with_known_constraints_returns_a_known_feasible_point_that_bea
 def test_optimize_with_a_curved_known_constraint_stays_inside_it():
     from BOproj.acquisition import optimize
     X, f_gp, _ = fitted()
-    acquisition = LogEIProduct(f_gp, best_f=float(bowl(X).max()))
+    acquisition = LogEIOfProduct(f_gp, best_g=float(bowl(X).max()))
 
     def outside_disc(Z):                                                # feasible only OUTSIDE the unit disc around (0.5, -0.5)
         return 1.0 - (torch.as_tensor(Z, dtype=torch.float64) - torch.tensor([0.5, -0.5], dtype=torch.float64)).pow(2).sum(dim=1)

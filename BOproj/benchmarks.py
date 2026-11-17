@@ -17,7 +17,7 @@ def rosenbrock(X):
 
 
 def neg_rosenbrock(X):
-    return -rosenbrock(X)
+    return -rosenbrock(X) +5000
 
 
 def neg_log_rosenbrock(X):

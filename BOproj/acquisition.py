@@ -1,17 +1,24 @@
-"""Acquisition for the BO loop: EI of the objective times the probability of feasibility of each constraint
-times the decision maker's acceptance probability, computed in log space:
+"""Acquisition for the BO loop: the expected improvement of the product g(x) = f(x) * pi(x) of the objective and the
+decision maker's preference score, times the probability of feasibility of each constraint, in log space:
 
-    log alpha(x) = log EI_f(x | best_f)  +  sum_i log P(c_i(x) <= 0)  +  log pi(x)
+    log alpha(x) = log E[max{f(x) pi(x) - g*, 0}]  +  sum_i log P(c_i(x) <= 0)
 
-    EI_f      ContinuousGP of the objective (BoTorch's LogExpectedImprovement: no underflow far from the incumbent)
+    f         ContinuousGP of the objective, f(x) ~ N(mean, sd^2)
+    pi(x)     the preference score, known once the preference model is fitted: the soft-Copeland score C(x) (with
+              landmarks) or E[Phi(u(x))], the probit of the latent utility u of a PreferenceGP; 1 without a DM
+    g*        the incumbent product, max_i y_i pi(x_i) over the feasible evaluations
     P(c_i<=0) Phi(-mean_i / sd_i) from the ContinuousGP of constraint i, as torch.special.log_ndtr (stable for
               very negative arguments, where log(Phi(z)) would give log(0) = -inf)
-    pi(x)     the decision maker's 'preference function': E[Phi(u(x))], the probit of the latent utility u of a
-              PreferenceGP fitted to pairwise comparisons (PreferenceGP.prob_torch)
 
-Every model takes inputs in original units (the transforms live inside the models).  best_f is the best value
-among feasible designs; when there is none yet, EI is undefined and the acquisition is log PoF alone (find a
-feasible design first).  The objective is MAXIMISED.
+pi(x) is not random, so  E[max{f pi - g*, 0}] = pi(x) * E[max{f - t(x), 0}],  t(x) = g* / pi(x): the usual EI of f with a
+threshold that depends on x (the less the DM likes x, the higher the bar), computed with BoTorch's stable helper.  An
+evaluated x with y pi(x) <= g* has nothing left to gain, so the loop does not keep resampling it.  Without a DM pi = 1
+and this is BoTorch's LogExpectedImprovement with best_f = the best y.  The product needs f > 0 (otherwise a smaller
+pi would make f pi larger).
+
+Every model takes inputs in original units (the transforms live inside the models).  When there is no feasible
+evaluation yet, EI is undefined and the acquisition is log PoF + log pi (find a feasible design first).  The objective
+is MAXIMISED.
 """
 
 from .gp_utils import DTYPE, bounds_tensor
@@ -19,26 +26,32 @@ from .gp_utils import DTYPE, bounds_tensor
 import numpy as np
 import torch
 from botorch.acquisition import AcquisitionFunction
-from botorch.acquisition.analytic import LogExpectedImprovement
+from botorch.acquisition.analytic import _log_ei_helper
 from botorch.optim import optimize_acqf
 from botorch.utils.transforms import t_batch_mode_transform
 
 
-class LogEIProduct(AcquisitionFunction):
-    """log [EI(x) * prod_i PoF_i(x) * pi(x)], pi(x) = E[Phi(u(x))] or, with landmarks, the soft-Copeland score C(x).
+class LogEIOfProduct(AcquisitionFunction):
+    """log E[max{f(x) pi(x) - g*, 0}] + sum_i log PoF_i(x), pi(x) the preference score (see the module docstring).
 
     f_gp       fitted ContinuousGP of the objective
     c_gps      fitted ContinuousGPs, one per constraint c_i(x) <= 0 (may be empty)
-    pref_gp    fitted PreferenceGP of the decision maker's comparisons (None: no preference factor)
-    best_f     best observed value among feasible designs (the EI threshold); None = there is none yet
-    copeland   a prepared copeland.SoftCopeland (pref_gp and fixed landmarks): the preference factor is then the
-               soft-Copeland score C(x) (González et al. 2017, eq. 5) instead of pi(x); None: pi(x)
+    pref_gp    fitted PreferenceGP of the decision maker's comparisons (None: no preference factor, pi = 1)
+    best_g     the incumbent product g* = max_i y_i pi(x_i) over the feasible evaluations; None = there is none yet
+    copeland   a prepared copeland.SoftCopeland (pref_gp and fixed landmarks): the preference score is then the
+               soft-Copeland score C(x) (González et al. 2017, eq. 5) instead of pi(x) = E[Phi(u(x))]; None: pi(x)
+
+    Its terms, each of shape (b,) for X of shape (b, 1, d), add up to the acquisition:
+        log_ei(X)    log E[max{f(x) - g* / pi(x), 0}]   (None while best_g is None)
+        log_pref(X)  log pi(x)
+        log_pof(X)   sum_i log P(c_i(x) <= 0)
     """
 
-    def __init__(self, f_gp, c_gps=(), pref_gp=None, best_f=None, copeland=None):
+    def __init__(self, f_gp, c_gps=(), pref_gp=None, best_g=None, copeland=None):
         super().__init__(model=f_gp.model)
         self.c_models, self.pref_gp, self.copeland = [c.model for c in c_gps], pref_gp, copeland
-        self.log_ei = None if best_f is None else LogExpectedImprovement(f_gp.model, best_f=best_f)
+        self.best_g = best_g
+        self.log_ei = None if best_g is None else self._log_ei
 
     def log_pof(self, X):
         """sum_i log P(c_i(X) <= 0), shape (b,), for X of shape (b, 1, d)."""
@@ -50,7 +63,7 @@ class LogEIProduct(AcquisitionFunction):
         return total
 
     def log_pref(self, X):
-        """log of the preference factor (pi or Copeland), shape (b,), for X of shape (b, 1, d); 0 without a preference model."""
+        """log of the preference score (pi or Copeland), shape (b,), for X of shape (b, 1, d); 0 without a preference model."""
         if self.pref_gp is None:
             return torch.zeros(X.shape[0], dtype=X.dtype)
         if self.copeland is None:
@@ -59,10 +72,23 @@ class LogEIProduct(AcquisitionFunction):
             score = self.copeland(X.reshape(-1, X.shape[-1]))
         return score.view(-1).clamp_min(1e-300).log()
 
-    @t_batch_mode_transform(expected_q=1)
-    def forward(self, X):
+    def _log_ei(self, X):
+        """log E[max{f(x) - t(x), 0}], t(x) = g* / pi(x), shape (b,), for X of shape (b, 1, d)."""
+        posterior = self.model.posterior(X)
+        mean = posterior.mean.view(-1)
+        sd = posterior.variance.clamp_min(1e-12).sqrt().view(-1)
+        threshold = self.best_g / self.log_pref(X).exp()
+        return sd.log() + _log_ei_helper((mean - threshold) / sd)
+
+    def value(self, X):
+        """log alpha for X of shape (b, 1, d) -> (b,).  A plain method, so that IPython's autoreload picks up edits (it
+        cannot update forward, whose decorator keeps the original function)."""
         log_probs = self.log_pof(X) + self.log_pref(X)
         return log_probs if self.log_ei is None else self.log_ei(X) + log_probs
+
+    @t_batch_mode_transform(expected_q=1)
+    def forward(self, X):
+        return self.value(X)
 
 
 def known_constraint_values(constraint, X):

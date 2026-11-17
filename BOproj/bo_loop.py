@@ -22,11 +22,12 @@ The DM is only asked these comparisons: the preference model is fitted once, bef
 
 One BO step
     propose():   fit the GPs on the data so far (once: they are kept in opt.models), maximise
-                 log EI + sum_i log PoF_i + log pi  (acquisition.LogEIProduct)
+                 log E[max{f pi - g*, 0}] + sum_i log PoF_i  (acquisition.LogEIOfProduct)
     evaluate():  call the objective and the constraints at the chosen x
     then the step is recorded (one row of history.csv) and saved.
-The incumbent (best y, the EI threshold) is the best feasible evaluation: best().  The preference steers the search
-through pi (or C); the recommended design, recommended(), weights the improvement by it.
+The EI threshold is the incumbent product g* = max_i y_i pi(x_i) over the feasible evaluations (pi = C or E[Phi(u)],
+1 without a DM: then g* is the best y, best()); the product needs y > 0.  The recommended design, recommended(),
+weights the improvement by the same score.
 
 Files in run_dir, rewritten after every evaluation
     config.json          settings, seed, library versions
@@ -51,7 +52,7 @@ import torch
 from scipy.stats import qmc
 
 from . import bo_plotting
-from .acquisition import LogEIProduct, known_feasible, optimize
+from .acquisition import LogEIOfProduct, known_feasible, optimize
 from .copeland import SoftCopeland
 from .gp import ContinuousGP, PreferenceGP
 from .gp_utils import DTYPE
@@ -289,9 +290,15 @@ class BayesianOptimizer:
     def acquisition(self, n=None):
         """The acquisition after the first n evaluations (default all), i.e. the one that chose evaluation n."""
         models = self.models_at(n)
-        _, best_y = self.best(n)
-        return LogEIProduct(models.objective, models.constraints, models.preference,
-                            best_f=None if np.isnan(best_y) else best_y, copeland=self.soft_copeland)
+        # EI of g = y * score with incumbent g* = max_i y_i * score(x_i) over the feasible data (score = 1 without a DM)
+        candidates = np.flatnonzero(self.feasible[:n])
+        best_g = None
+        if len(candidates):
+            scores = self.preference_scores(self.X[candidates])
+            y = self.y[candidates]
+            best_g = float(np.max(y if scores is None else y * scores))
+        return LogEIOfProduct(models.objective, models.constraints, models.preference, best_g=best_g,
+                              copeland=self.soft_copeland)
 
     #recording and saving
     def _record(self, phase, proposal):
