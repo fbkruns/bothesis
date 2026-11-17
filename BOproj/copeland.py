@@ -28,8 +28,8 @@ class SoftCopeland:
         """Compute and store everything that depends on the landmarks only.  Call again after refitting the GP."""
         model = self.preference_gp.model
         with torch.no_grad():
-            model.posterior(self.landmarks[:1])                   # PairwiseGP refreshes its derived values lazily
-            self._train_inputs = model.transform_inputs(model.datapoints)
+            model.posterior(self.landmarks[:1])                   # PairwiseGP refreshes its derived values
+            self._train_inputs = model.transform_inputs(model.datapoints)  
             self._weights = torch.cholesky_solve(
                 (model.utility - model._prior_mean(self._train_inputs)).unsqueeze(-1), model.covar_chol)
             self._link_to_data = torch.linalg.solve(model.hlcov_eye, model.likelihood_hess)

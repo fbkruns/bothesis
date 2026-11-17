@@ -1,0 +1,36 @@
+{
+  "objective": "noisy_objective",
+  "constraints": [],
+  "known_constraints": [],
+  "bounds": [
+    [
+      -5.0,
+      10.0
+    ],
+    [
+      0.0,
+      15.0
+    ]
+  ],
+  "init": "random",
+  "n_init": 1,
+  "strategy": "logei",
+  "seed": 27,
+  "decision_maker": "decision_maker_utility",
+  "n_pref": 15,
+  "preference_score": "copeland",
+  "n_landmarks": 64,
+  "f_optimum": -0.397887,
+  "x_optimum": [
+    3.141592653589793,
+    2.275
+  ],
+  "num_restarts": 10,
+  "raw_samples": 512,
+  "started": "2026-11-17 08:47:55",
+  "versions": {
+    "numpy": "2.5.4",
+    "torch": "2.14.1+cu130",
+    "botorch": "0.18.1"
+  }
+}

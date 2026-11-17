@@ -1,0 +1,38 @@
+{
+  "objective": "neg_rosenbrock",
+  "constraints": [],
+  "known_constraints": [
+    "quarter_disc"
+  ],
+  "bounds": [
+    [
+      -2.0,
+      2.0
+    ],
+    [
+      -2.0,
+      2.0
+    ]
+  ],
+  "init": "sobol",
+  "n_init": 6,
+  "strategy": "logei",
+  "seed": 0,
+  "decision_maker": null,
+  "n_pref": 0,
+  "preference_score": "probability",
+  "n_landmarks": 64,
+  "f_optimum": -0.0,
+  "x_optimum": [
+    1.0,
+    1.0
+  ],
+  "num_restarts": 10,
+  "raw_samples": 512,
+  "started": "2026-11-16 15:48:24",
+  "versions": {
+    "numpy": "2.5.4",
+    "torch": "2.14.1+cu130",
+    "botorch": "0.18.1"
+  }
+}

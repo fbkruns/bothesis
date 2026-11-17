@@ -14,8 +14,9 @@ among feasible designs; when there is none yet, EI is undefined and the acquisit
 feasible design first).  The objective is MAXIMISED.
 """
 
-from .gp_utils import bounds_tensor
+from .gp_utils import DTYPE, bounds_tensor
 
+import numpy as np
 import torch
 from botorch.acquisition import AcquisitionFunction
 from botorch.acquisition.analytic import LogExpectedImprovement
@@ -64,11 +65,70 @@ class LogEIProduct(AcquisitionFunction):
         return log_probs if self.log_ei is None else self.log_ei(X) + log_probs
 
 
-def optimize(acq, bounds, d, num_restarts=10, raw_samples=512, seed=0):
+def known_constraint_values(constraint, X):
+    """c(X) as a numpy array (n,) for numpy designs X (n, d).  A known constraint is a cheap exact function of a torch tensor
+    (n, d) -> (n,), feasible where <= 0, written with torch operations so that BoTorch can differentiate it (no GP).
+    This is its numpy-in, numpy-out use (plots, feasibility of evaluated designs)."""
+    with torch.no_grad():
+        return constraint(torch.as_tensor(np.atleast_2d(X), dtype=DTYPE)).detach().numpy()
+
+
+def known_feasible(X, known_constraints):
+    """Bool array (n,) for the designs X (n, d): every known constraint c(X) <= 0 holds."""
+    return np.all([known_constraint_values(constraint, X) <= 0 for constraint in known_constraints], axis=0)
+
+
+def optimize(acq, bounds, d, num_restarts=10, raw_samples=512, seed=0, known_constraints=()):
     """Maximise acq over the box with BoTorch's multi-start L-BFGS-B: evaluate raw_samples random points, start
-    L-BFGS-B from the num_restarts best of them, keep the best end point.  Returns (x as numpy (d,), acq value)."""
+    L-BFGS-B from the num_restarts best of them, keep the best end point.  Returns (x as numpy (d,), acq value).
+
+    known_constraints  cheap exact constraints (torch functions c(X) <= 0, see known_constraint_values): only designs where
+                       all hold are considered.  They are passed to optimize_acqf as nonlinear_inequality_constraints, which
+                       BoTorch solves with SLSQP; it needs starting points that already satisfy them, so the num_restarts
+                       starts are the best of raw_samples random known-feasible designs."""
     box = bounds_tensor(bounds, d)
     with torch.random.fork_rng():
         torch.manual_seed(seed)
-        x, value = optimize_acqf(acq, bounds=box, q=1, num_restarts=num_restarts, raw_samples=raw_samples)
-    return x.detach().squeeze(0).numpy(), float(value)
+        if not known_constraints:
+            x, value = optimize_acqf(acq, bounds=box, q=1, num_restarts=num_restarts, raw_samples=raw_samples)
+            return x.detach().squeeze(0).numpy(), float(value)
+        starts = _sample_known_feasible(box, known_constraints, raw_samples)
+        if not acq(starts[:1].clone().requires_grad_(True).unsqueeze(1)).requires_grad:
+            # no EI, no black-box constraint and no preference model yet (nothing feasible so far): the acquisition does not
+            # depend on x, there is no gradient to follow and any known-feasible design is as good as another
+            return starts[0].numpy(), float(acq(starts[:1].unsqueeze(1)))
+        with torch.no_grad():
+            starts = starts[torch.topk(acq(starts.unsqueeze(1)), min(num_restarts, len(starts))).indices]
+        x, value = optimize_acqf(acq, bounds=box, q=1, num_restarts=len(starts),
+                                 nonlinear_inequality_constraints=[(_for_botorch(c), True) for c in known_constraints],
+                                 batch_initial_conditions=starts.unsqueeze(1))
+    x = x.detach().squeeze(0)
+    return _into_known_region(x, starts[0], known_constraints).numpy(), float(value)
+
+
+def _for_botorch(constraint):
+    """Our convention c(X) <= 0 on an (n, d) tensor -> BoTorch's: callable(x) >= 0 on one design x of shape (d,), a scalar."""
+    return lambda x: -constraint(x.unsqueeze(0)).squeeze()
+
+
+def _into_known_region(x, anchor, known_constraints):
+    """SLSQP can end a hair outside the region (a violation of 1e-9 on its edge).  The recommendation and the incumbent check
+    the constraints exactly, so move x towards a known-feasible anchor in tiny steps until it is feasible: it stays on the edge."""
+    for t in [0.0] + [10.0 ** -k for k in range(10, -1, -1)]:
+        candidate = x + t * (anchor - x)
+        if known_feasible(candidate.numpy(), known_constraints)[0]:
+            return candidate
+    return anchor
+
+
+def _sample_known_feasible(box, known_constraints, n, max_rounds=200):
+    """n random designs in the box that satisfy the known constraints (rejection sampling), as a tensor (n, d)."""
+    low, high = box[0], box[1]
+    kept = torch.empty(0, box.shape[1], dtype=box.dtype)
+    for _ in range(max_rounds):
+        X = low + torch.rand(n, box.shape[1], dtype=box.dtype) * (high - low)
+        kept = torch.cat([kept, X[torch.as_tensor(known_feasible(X.numpy(), known_constraints))]])
+        if len(kept) >= n:
+            return kept[:n]
+    raise ValueError(f"only {len(kept)} known-feasible designs in {max_rounds * n} random ones: the region where all "
+                     "known constraints hold is empty or tiny")

@@ -7,6 +7,11 @@
 The problem
     objective(X)    (n, d) -> (n,), MAXIMISED
     constraint(X)   (n, d) -> (n,), feasible where <= 0; each constraint gets its own ContinuousGP
+    known_constraints  cheap exact constraints (no GP, no PoF, not stored in C), written as torch functions c(X) <= 0 of an
+                    (n, d) tensor so that BoTorch can differentiate them: the search for the next design (BoTorch's
+                    nonlinear_inequality_constraints) and the random baseline are restricted to where they all hold.
+                    The initial design covers the whole box: a design outside the known region counts as infeasible
+                    and is never the incumbent.
     bounds          (d, 2) the search box (fixed)
 
 The decision maker (optional)
@@ -20,8 +25,8 @@ One BO step
                  log EI + sum_i log PoF_i + log pi  (acquisition.LogEIProduct)
     evaluate():  call the objective and the constraints at the chosen x
     then the step is recorded (one row of history.csv) and saved.
-The incumbent (best y, the EI threshold) is the best feasible evaluation.  The preference steers the search through
-pi; it does not decide which design is the best.
+The incumbent (best y, the EI threshold) is the best feasible evaluation: best().  The preference steers the search
+through pi (or C); the recommended design, recommended(), weights the improvement by it.
 
 Files in run_dir, rewritten after every evaluation
     config.json          settings, seed, library versions
@@ -46,7 +51,7 @@ import torch
 from scipy.stats import qmc
 
 from . import bo_plotting
-from .acquisition import LogEIProduct, optimize
+from .acquisition import LogEIProduct, known_feasible, optimize
 from .copeland import SoftCopeland
 from .gp import ContinuousGP, PreferenceGP
 from .gp_utils import DTYPE
@@ -56,8 +61,24 @@ from .gp_utils import DTYPE
 Models = namedtuple("Models", "objective constraints preference")
 
 
-def initial_design(bounds, n, method="sobol", seed=27):
-    """n points inside bounds (d, 2). Possible methods: 'sobol' (default), 'lhs' or 'random'."""
+def initial_design(bounds, n, method="sobol", seed=27, accept=None):
+    """n points inside bounds (d, 2). Possible methods: 'sobol' (default), 'lhs' or 'random'.
+
+    accept  optional function (m, d) -> (m,) bools; only the designs where it is True are kept: the design is drawn with
+            more and more points (same seed) until n are accepted, and the first n accepted ones are returned."""
+    if accept is None:
+        return _draw_design(bounds, n, method, seed)
+    m = n
+    while m <= 2 ** 20:
+        points = _draw_design(bounds, m, method, seed)
+        kept = points[np.asarray(accept(points), bool)]
+        if len(kept) >= n:
+            return kept[:n]
+        m *= 2
+    raise ValueError("fewer than n accepted designs among 2**20 drawn ones: the accepted region is empty or tiny")
+
+
+def _draw_design(bounds, n, method, seed):
     box = np.asarray(bounds, float)
     if method == "sobol":
         with warnings.catch_warnings():
@@ -84,22 +105,25 @@ class BayesianOptimizer:
     """
 
     num_restarts, raw_samples = 10, 512        # the acquisition optimiser's L-BFGS-B starts and random candidates
+    known_constraints = ()                     # class default: runs pickled before known constraints existed still load
 
     def __init__(self, objective, bounds, constraints=(), comparer=None, X_pref=None, init="sobol", n_init=None,
                  strategy="logei", seed=0, run_dir=None, f_optimum=None, x_optimum=None,
-                 preference_score="probability", n_landmarks=64):
+                 preference_score="probability", n_landmarks=64, known_constraints=()):
         if preference_score not in ("probability", "copeland"):
             raise ValueError("preference_score must be 'probability' or 'copeland'")
         self.objective, self.constraints = objective, list(constraints)
+        self.known_constraints = list(known_constraints)
         self.bounds = np.asarray(bounds, float)
         self.d, self.m = len(self.bounds), len(self.constraints)
         self.comparer = comparer
         self.X_pref = np.empty((0, self.d)) if X_pref is None else np.asarray(X_pref, float)
         self.init, self.n_init = init, n_init or 2 * (self.d + 1)
-        self.X_init = initial_design(self.bounds, self.n_init, init, seed)
+        self.X_init = initial_design(self.bounds, self.n_init, init, seed)       # the whole box: designs outside the known region are allowed
+        known_region = self._known_feasible if self.known_constraints else None
         self.strategy, self.seed, self.rng = strategy, seed, np.random.default_rng(seed)
         self.preference_score, self.n_landmarks = preference_score, n_landmarks
-        self.landmarks = initial_design(self.bounds, n_landmarks, "random", seed) if preference_score == "copeland" else None
+        self.landmarks = initial_design(self.bounds, n_landmarks, "lhs", seed, known_region) if preference_score == "copeland" else None
         self.run_dir = None if run_dir is None else Path(run_dir)
         self.f_optimum = f_optimum
         self.x_optimum = None if x_optimum is None else np.asarray(x_optimum, float)
@@ -111,11 +135,13 @@ class BayesianOptimizer:
         self.soft_copeland = None                                 # its Copeland score over the landmarks (copeland only)
         self.records, self.models = [], {}      # rows of history.csv;  n -> the GPs fitted on the first n evaluations
 
-    #the data
+    #data
     @property
     def feasible(self):
-        """Per evaluation: every constraint <= 0 (always True without constraints)."""
-        return np.all(self.C <= 0, axis=1)
+        """Per evaluation: every constraint <= 0 and every known constraint holds (always True without constraints).
+        A design outside the known region counts as infeasible: it never becomes the incumbent or the recommendation."""
+        feasible = np.all(self.C <= 0, axis=1)
+        return feasible & self._known_feasible(self.X) if self.known_constraints and len(self.X) else feasible
 
     def best(self, n=None):
         """(x, y) of the best feasible evaluation among the first n (default all), or (None, nan)."""
@@ -123,6 +149,38 @@ class BayesianOptimizer:
         if not len(candidates):
             return None, np.nan
         i = candidates[np.argmax(self.y[candidates])]
+        return self.X[i], self.y[i]
+
+    def preference_scores(self, X):
+        """The preference factor of the acquisition at the designs X (n, d), as a numpy array (n,): the soft-Copeland
+        score C(x) or pi(x) = E[Phi(u(x))], from the preference model fitted once on the DM's comparisons.
+        None when the run has no preference model."""
+        if self.preference_gp is None:
+            return None
+        with torch.no_grad():
+            if self.soft_copeland is not None:
+                return self.soft_copeland(X).numpy()
+            return self.preference_gp.prob_torch(X).numpy()
+
+    def recommended(self, n=None):
+        """(x, y) of the evaluation to recommend among the first n (default all), or (None, nan) if none is feasible.
+        Without a preference model this is just best(n).  With one it maximises the improvement over the worst feasible
+        observation, weighted by the learned preference score (C(x) or pi(x)), the same improvement-times-acceptability
+        as the acquisition:
+            weight(x_i) = max(y_i - lowest feasible y among the first n, 0) * preference_scores(x_i)
+        If every weight is 0 (all feasible y equal, or every score 0) it falls back to best(n).  best() itself is not
+        changed by this: it stays the incumbent of EI, of the regret and of summary.json."""
+        candidates = np.flatnonzero(self.feasible[:n])
+        if not len(candidates):
+            return self.best(n)
+        scores = self.preference_scores(self.X[candidates])
+        if scores is None:
+            return self.best(n)
+        y = self.y[candidates]
+        weights = np.maximum(y - y.min(), 0) * scores
+        if weights.max() <= 0:
+            return self.best(n)
+        i = candidates[np.argmax(weights)]
         return self.X[i], self.y[i]
 
     def history(self, column):
@@ -141,11 +199,23 @@ class BayesianOptimizer:
             self._step(x, "init")
         for _ in range(n_iter):
             if self.strategy == "random":
-                self._step(self.bounds[:, 0] + self.rng.random(self.d) * np.ptp(self.bounds, axis=1), "rand")
+                self._step(self._random_design(), "rand")
             else:
                 x, proposal = self.propose()
                 self._step(x, "bo", proposal)
         return self
+
+    def _known_feasible(self, X):
+        """Bool array (n,): the designs X (n, d) satisfy every known constraint."""
+        return known_feasible(X, self.known_constraints)
+
+    def _random_design(self):
+        """A uniform random design in the box, drawn again until it satisfies the known constraints."""
+        for _ in range(100_000):
+            x = self.bounds[:, 0] + self.rng.random(self.d) * np.ptp(self.bounds, axis=1)
+            if not self.known_constraints or self._known_feasible(x)[0]:
+                return x
+        raise ValueError("no known-feasible random design in 100000 draws: the region where all known constraints hold is empty or tiny")
 
     def propose(self):
         """The next design: maximise the acquisition built on the GPs of all evaluations so far.
@@ -156,7 +226,7 @@ class BayesianOptimizer:
         t_fit = time.perf_counter() - t_start
         acquisition = self.acquisition(n)
         x, acq_value = optimize(acquisition, self.bounds, self.d, self.num_restarts, self.raw_samples,
-                                seed=self.seed * 100_003 + n)
+                                seed=self.seed * 100_003 + n, known_constraints=self.known_constraints)
         mean, var = models.objective.predict(x)                     # gp.py reads a (d,) array as one design
         with torch.no_grad():
             x_batch = torch.as_tensor(x[None, None], dtype=DTYPE)
@@ -241,6 +311,7 @@ class BayesianOptimizer:
         import botorch
         (self.run_dir / "models").mkdir(parents=True, exist_ok=True)
         config = {"objective": _name(self.objective), "constraints": [_name(c) for c in self.constraints],
+                  "known_constraints": [_name(c) for c in self.known_constraints],
                   "bounds": self.bounds.tolist(), "init": self.init, "n_init": self.n_init,
                   "strategy": self.strategy, "seed": self.seed,
                   "decision_maker": None if self.comparer is None else _name(getattr(self.comparer, "utility",

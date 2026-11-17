@@ -11,6 +11,7 @@ Common arguments, as in gp_plotting.py:
 import numpy as np
 import torch
 
+from .acquisition import known_constraint_values
 from .gp_plotting import _figure, _finish, _use_backend
 from .gp_utils import DTYPE
 
@@ -32,6 +33,18 @@ def _grid(opt, dims, fixed, n):
     return grid_x1, grid_x2, X_grid
 
 
+def _stacked_colorbars(fig, axis, bars):
+    """Colour bars in a column just right of the axis, one above the other (first = top), each an equal share of the
+    axis height.  They are drawn on inset axes, so the plot itself keeps the whole width of its slot.
+    bars: [(mappable, label, colorbar options)]"""
+    gap = 0.14
+    height = (1 - gap * (len(bars) - 1)) / len(bars)
+    for position, (mappable, label, options) in enumerate(bars):
+        bottom = 1 - (position + 1) * height - position * gap
+        bar = fig.colorbar(mappable, cax=axis.inset_axes([1.03, bottom, 0.04, height]), label=label, **options)
+        bar.minorticks_off()
+
+
 def _as_runs(runs):
     """BayesianOptimizer | list of them | {label: list} -> {label: list}."""
     if isinstance(runs, dict):
@@ -47,11 +60,14 @@ def plot_points(opt, dims=None, fixed=None, background=None, background_label="f
     background_scale 'linear' (default), or 'log': log-spaced colours (a display choice only, the values are untouched;
     values below 1e-4 of the maximum share the lowest colour) so that a function spanning orders of magnitude keeps
     its contrast.  Backgrounds with negative values always use linear colours.
-    step_colorbar False: no colour bar for the BO step (2-d plots; the plot gets the space).
+    step_colorbar False: no colour bar for the BO step (2-d plots).
+    2-d plots: the colour bars (background on top, BO step below, each half the height) sit to the right of the plot, and the
+    legend below it, so nothing covers the map.
 
     initial design: white squares;  BO points: coloured by step;  infeasible: hollow.  Also drawn: constraint
     boundaries c_i = 0 (white dashed), the true boundary u = 0 when the comparer has a .utility (magenta dotted), the
-    known optimum (black star) and the best design found (cyan X).  1-d problems: f against x."""
+    known optimum (black star) and the best design found (cyan X: opt.recommended(); with a preference model also a hollow
+    cyan circle at the highest y when that is a different design).  1-d problems: f against x."""
     _use_backend(show)
     fig, (axis,) = _figure(ax, size=(6.4, 5.2))
     X, n_init = opt.X, opt.n_init
@@ -61,8 +77,8 @@ def plot_points(opt, dims=None, fixed=None, background=None, background_label="f
             x_line = np.linspace(*opt.bounds[0], 400)[:, None]
             axis.plot(x_line[:, 0], background(x_line), "k--", lw=1, label=background_label)
         axis.scatter(X[:n_init, 0], opt.y[:n_init], marker="s", c="w", edgecolors="k", label="initial design")
-        scatter = axis.scatter(X[n_init:, 0], opt.y[n_init:], c=bo_steps, cmap="autumn", edgecolors="k", label="BO")
-        fig.colorbar(scatter, ax=axis, label="BO step")
+        scatter = axis.scatter(X[n_init:, 0], opt.y[n_init:], c=bo_steps, cmap="autumn", edgecolors="k", label="BO (red = early, yellow = late)")
+        fig.colorbar(scatter, ax=axis, label="BO step (red = early, yellow = late)")
         axis.set(xlabel="x1", ylabel="y")
         axis.legend(fontsize=8)
         axis.set_title(title or f"{len(X)} evaluations ({n_init} initial)")
@@ -71,6 +87,7 @@ def plot_points(opt, dims=None, fixed=None, background=None, background_label="f
     dims, fixed = _dims_fixed(opt, dims, fixed)
     grid_x1, grid_x2, X_grid = _grid(opt, dims, fixed, n)
     on_grid = lambda values: np.asarray(values).reshape(grid_x1.shape)
+    colour_bars = []                                                       # (mappable, label, options), top to bottom
     if background is not None:
         values = on_grid(background(X_grid))
         levels, norm, extend = 30, None, "neither"
@@ -82,14 +99,14 @@ def plot_points(opt, dims=None, fixed=None, background=None, background_label="f
         contours = axis.contourf(grid_x1, grid_x2, values, levels=levels, norm=norm, extend=extend,
                                  cmap=("viridis_r" if cmap is None else cmap))
         if norm is None:
-            fig.colorbar(contours, ax=axis, label=background_label)
+            colour_bars.append((contours, background_label, {}))
         else:                                                              # ticks at powers of ten, plain numbers
             decades = 10.0 ** np.arange(np.ceil(np.log10(floor)), np.floor(np.log10(values.max())) + 1)
-            bar = fig.colorbar(contours, ax=axis, label=background_label + " (log colours)", ticks=decades, format="%g")
-            bar.minorticks_off()
-    for i, constraint in enumerate(opt.constraints):
-        axis.contour(grid_x1, grid_x2, on_grid(constraint(X_grid)), levels=[0], colors="w", linestyles="--",
-                     linewidths=1.3)
+            colour_bars.append((contours, background_label + " (log colours)", dict(ticks=decades, format="%g")))
+    boundaries = [constraint(X_grid) for constraint in opt.constraints] \
+        + [known_constraint_values(constraint, X_grid) for constraint in getattr(opt, "known_constraints", [])]
+    for i, values in enumerate(boundaries):
+        axis.contour(grid_x1, grid_x2, on_grid(values), levels=[0], colors="w", linestyles="--", linewidths=1.3)
         if i == 0:
             axis.plot([], [], "w--", label="constraint boundary")
     if hasattr(opt.comparer, "utility"):                                  # draw where the true utility is 0
@@ -102,18 +119,25 @@ def plot_points(opt, dims=None, fixed=None, background=None, background_label="f
     axis.scatter(*init_points[init_feasible].T, marker="s", c="w", edgecolors="k", s=35, label="initial design")
     axis.scatter(*init_points[~init_feasible].T, marker="s", facecolors="none", edgecolors="k", s=35)
     scatter = axis.scatter(*bo_points[bo_feasible].T, c=bo_steps[bo_feasible], cmap="autumn", vmin=0,
-                           vmax=max(len(bo_steps) - 1, 1), edgecolors="k", s=35, label="BO points")
+                           vmax=max(len(bo_steps) - 1, 1), edgecolors="k", s=35, label="BO points: red = early, yellow = late")
     axis.scatter(*bo_points[~bo_feasible].T, facecolors="none", edgecolors="k", s=35)
     if len(bo_steps) and step_colorbar:
-        fig.colorbar(scatter, ax=axis, label="BO step")
+        colour_bars.append((scatter, "BO step (red = early, yellow = late)", {}))
+    if colour_bars:
+        _stacked_colorbars(fig, axis, colour_bars)
     if opt.x_optimum is not None:
         axis.scatter(*opt.x_optimum[dims], marker="*", c="k", s=220, label="optimum")
+    recommended_x, _ = opt.recommended()
+    if recommended_x is not None:
+        label = "best found" if opt.preference_gp is None else "recommended (improvement x preference score)"
+        axis.scatter(*recommended_x[dims], marker="X", c="cyan", edgecolors="k", s=130, label=label)
     best_x, _ = opt.best()
-    if best_x is not None:
-        axis.scatter(*best_x[dims], marker="X", c="cyan", edgecolors="k", s=130, label="best found")
+    if opt.preference_gp is not None and best_x is not None and not np.array_equal(best_x, recommended_x):
+        axis.scatter(*best_x[dims], marker="o", facecolors="none", edgecolors="cyan", linewidths=2, s=190,
+                     label="highest y (ignores the DM)")
     axis.set(xlim=opt.bounds[dims[0]], ylim=opt.bounds[dims[1]], xlabel=f"x{dims[0] + 1}", ylabel=f"x{dims[1] + 1}")
     axis.set_aspect("equal")
-    axis.legend(fontsize=7, loc="lower left")
+    axis.legend(fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=2, frameon=False)   # below the plot
     axis.set_title(title or f"{len(X)} evaluations ({n_init} initial)")   # on the axis: works inside subplot grids
     return _finish(fig, show, save, keep_open=ax is not None)
 

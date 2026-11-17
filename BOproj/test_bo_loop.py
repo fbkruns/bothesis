@@ -221,3 +221,110 @@ def test_pairwise_run_is_reproducible_whatever_the_global_random_state():
         runs.append(FastOptimizer(bowl, BOUNDS, comparer=PairwiseLabeler(u_linear), seed=3,
                                   X_pref=initial_design(BOUNDS, 10, "sobol", seed=1)).run(4).X)
     assert np.array_equal(runs[0], runs[1])
+
+
+@pytest.mark.parametrize("score", ["probability", "copeland"])
+def test_recommended_is_improvement_times_preference_score_and_best_is_untouched(score):
+    from BOproj.benchmarks import PairwiseLabeler
+    plain = FastOptimizer(bowl, BOUNDS, seed=0).run(3)
+    assert plain.preference_scores(plain.X) is None
+    assert np.array_equal(plain.recommended()[0], plain.best()[0])      # no preference model: the plain best
+
+    opt = FastOptimizer(bowl, BOUNDS, comparer=PairwiseLabeler(u_linear), seed=0, preference_score=score, n_landmarks=16,
+                        X_pref=initial_design(BOUNDS, 10, "sobol", seed=1)).run(3)
+    scores = opt.preference_scores(opt.X)
+    assert scores.shape == (len(opt.y),) and np.all((scores >= 0) & (scores <= 1))
+    weighted = (opt.y - opt.y.min()) * scores                           # bowl has no constraints: every evaluation counts
+    _, recommended_y = opt.recommended()
+    assert np.isclose(recommended_y, opt.y[np.argmax(weighted)])
+    assert np.isclose(opt.best()[1], opt.y.max())                       # the incumbent is still the highest y
+
+
+#known constraints (exact, no GP)
+
+
+def known_cut(X):
+    """Known constraint, a torch function of an (n, 2) tensor: feasible where x1 <= 0.  The maximum of bowl, at x1 = 0.5, is cut off."""
+    return torch.as_tensor(X, dtype=torch.float64).reshape(-1, 2)[:, 0]
+
+
+def values(constraint, X):
+    from BOproj.acquisition import known_constraint_values
+    return known_constraint_values(constraint, X)
+
+
+def test_initial_design_with_accept_keeps_only_accepted_designs_and_is_unchanged_without_it():
+    plain = initial_design(BOUNDS, 8, "sobol", seed=3)
+    assert np.array_equal(initial_design(BOUNDS, 8, "sobol", seed=3, accept=None), plain)
+    kept = initial_design(BOUNDS, 8, "sobol", seed=3, accept=lambda X: values(known_cut, X) <= 0)
+    assert kept.shape == (8, 2) and np.all(kept[:, 0] <= 0)
+    with pytest.raises(ValueError):
+        initial_design(BOUNDS, 4, "random", seed=0, accept=lambda X: np.zeros(len(X), bool))
+
+
+def test_optimize_with_known_constraints_returns_a_known_feasible_point_that_beats_random_feasible_ones():
+    from BOproj.acquisition import known_feasible, optimize
+    X, f_gp, _ = fitted()
+    acquisition = LogEIProduct(f_gp, best_f=float(bowl(X).max()))
+    x, value = optimize(acquisition, BOUNDS, 2, known_constraints=[known_cut])
+    assert values(known_cut, x)[0] <= 0                                 # exactly feasible, also when the optimum is on the edge
+    rng = np.random.default_rng(0)
+    random_points = rng.uniform(-2, 2, (400, 2))
+    random_points = random_points[known_feasible(random_points, [known_cut])]
+    with torch.no_grad():
+        random_values = acquisition(torch.as_tensor(random_points[:, None, :])).numpy()
+    assert value >= random_values.max() - 1e-9
+    with pytest.raises(ValueError):                                     # nothing is known-feasible
+        optimize(acquisition, BOUNDS, 2, known_constraints=[lambda X: torch.ones(len(X), dtype=torch.float64)])
+
+
+def test_optimize_with_a_curved_known_constraint_stays_inside_it():
+    from BOproj.acquisition import optimize
+    X, f_gp, _ = fitted()
+    acquisition = LogEIProduct(f_gp, best_f=float(bowl(X).max()))
+
+    def outside_disc(Z):                                                # feasible only OUTSIDE the unit disc around (0.5, -0.5)
+        return 1.0 - (torch.as_tensor(Z, dtype=torch.float64) - torch.tensor([0.5, -0.5], dtype=torch.float64)).pow(2).sum(dim=1)
+
+    for seed in range(3):
+        x, _ = optimize(acquisition, BOUNDS, 2, seed=seed, known_constraints=[outside_disc])
+        assert values(outside_disc, x)[0] <= 0
+
+
+def test_known_constraints_are_exact_filters_with_no_gp_and_the_search_stays_inside(tmp_path):
+    opt = FastOptimizer(bowl, BOUNDS, known_constraints=[known_cut], seed=0, run_dir=tmp_path).run(6)
+    assert opt.m == 0 and opt.C.shape == (len(opt.y), 0)                 # no black-box constraint, nothing stored in C
+    assert all(len(models.constraints) == 0 for models in opt.models.values())      # and no GP fitted for the known one
+    assert np.all(values(known_cut, opt.X[opt.n_init:]) <= 0)            # every BO point (the initial design covers the whole box)
+    assert values(known_cut, opt.best()[0])[0] <= 0
+    assert json.loads((tmp_path / "config.json").read_text())["known_constraints"] == ["known_cut"]
+
+
+def test_random_strategy_respects_known_constraints():
+    opt = FastOptimizer(bowl, BOUNDS, known_constraints=[known_cut], strategy="random", seed=1).run(10)
+    assert np.all(values(known_cut, opt.X[opt.n_init:]) <= 0)
+
+
+def test_initial_design_outside_the_known_region_is_allowed_but_never_the_incumbent():
+    opt = FastOptimizer(bowl, BOUNDS, known_constraints=[known_cut], seed=0).run(4)
+    outside = values(known_cut, opt.X) > 0
+    assert outside[:opt.n_init].any()                                    # the initial design does cover the whole box
+    assert not np.any(outside[opt.n_init:])                              # the search stays inside
+    assert not opt.feasible[outside].any()
+    assert values(known_cut, opt.best()[0])[0] <= 0 and values(known_cut, opt.recommended()[0])[0] <= 0
+    assert opt.best()[1] < opt.y[outside].max()                          # a better y outside did not become the incumbent
+
+
+def test_no_initial_design_point_in_the_known_region_the_search_finds_it():
+    start = initial_design(BOUNDS, 6, "sobol", seed=0)                   # what the optimiser evaluates first (n_init = 6, seed 0)
+    corner = torch.tensor([-1.9, -1.9], dtype=torch.float64)
+    radius = 0.5 * np.linalg.norm(start - corner.numpy(), axis=1).min()
+
+    def tiny_disc(X):                                                    # known-feasible only near the corner, away from every initial point
+        return (torch.as_tensor(X, dtype=torch.float64) - corner).pow(2).sum(dim=1) - radius ** 2
+
+    assert np.all(values(tiny_disc, start) > 0)
+    opt = FastOptimizer(bowl, BOUNDS, known_constraints=[tiny_disc], seed=0).run(3)
+    assert opt.best(opt.n_init)[0] is None                               # nothing feasible after the initial design
+    assert np.all(values(tiny_disc, opt.X[opt.n_init:]) <= 0)            # the search goes straight into the region
+    assert opt.best()[0] is not None and values(tiny_disc, opt.best()[0])[0] <= 0
